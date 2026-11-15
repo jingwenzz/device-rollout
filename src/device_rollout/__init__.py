@@ -2,5 +2,14 @@
 
 from .device import SimulatedDevice
 from .messages import Ack, DesiredAssignment, Heartbeat
+from .platform import ConfigVersion, DeviceRecord, Platform
 
-__all__ = ["Ack", "DesiredAssignment", "Heartbeat", "SimulatedDevice"]
+__all__ = [
+    "Ack",
+    "ConfigVersion",
+    "DesiredAssignment",
+    "DeviceRecord",
+    "Heartbeat",
+    "Platform",
+    "SimulatedDevice",
+]
