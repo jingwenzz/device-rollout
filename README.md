@@ -21,12 +21,19 @@ apply it and ack, or fail the apply when a failure is injected.
 The platform backend skeleton is in place too. It stores config
 versions and the device registry in SQLite: every device record holds
 its desired and reported version, desired is written only by the
-platform, reported only from device heartbeats, and a device status
-(offline, in sync, pending) is derived from the record and the
-heartbeat timeout instead of being stored.
+platform, reported only from device messages, and a device status
+(offline, in sync, pending, failed) is derived from the record, the
+heartbeat timeout and the ack log instead of being stored.
 
-The sync loop and the staged rollout engine are not built yet; they
-arrive in later steps of the project plan.
+The sync loop is in place. It delivers a device desired version with
+a per device increasing sequence, hands the device ack back to the
+platform, and only then does reported move. Syncing a device that is
+already in sync sends nothing and produces no second ack, a duplicate
+ack is not double counted, and a stale applied ack is logged without
+moving reported state.
+
+The staged rollout engine is not built yet; it arrives in a later
+step of the project plan.
 
 ## Run the tests
 
@@ -39,13 +46,16 @@ successful applies, duplicate and stale assignments, rollback to a
 lower version carried by a newer sequence, injected failures, and
 offline behaviour, plus the platform side: config publishing and
 version links, registry behaviour, desired versus reported queries,
-derived status, and persistence across reopening the database.
+derived status, and persistence across reopening the database, plus
+the sync loop: ack driven reported updates, duplicate sync and
+duplicate ack idempotency, stale ack handling, and failed status.
 
 ## Run the demos
 
 ```bash
 PYTHONPATH=src python3 examples/demo_device.py
 PYTHONPATH=src python3 examples/demo_platform.py
+PYTHONPATH=src python3 examples/demo_sync.py
 ```
 
 The device demo walks one healthy device and one device that is set
@@ -56,3 +66,8 @@ The platform demo publishes two config versions, registers three
 devices, and sets a new desired version for two of them. It shows the
 gap the rest of the system exists to close: desired moves on intent
 alone, reported only moves when a device actually applies.
+
+The sync demo closes that gap for three devices set to desired v2:
+one applies, one fails and stays on v1 with a failed status, and one
+offline device is skipped. A duplicate sync produces no second ack,
+and clearing the failure lets a retry bring the failed device in sync.
