@@ -12,10 +12,14 @@ owns two kinds of state, and nothing else yet:
   edited in place; publishing a fix means publishing a new version.
 
 Both live in SQLite so state survives a restart and can be inspected
-with plain queries. There is deliberately no delivery, no ack
-processing, and no rollout engine in this module: setting a desired
-version only records the intent. Moving a device to that version is
-the sync loop, which arrives in a later step.
+with plain queries. This module also records acks: an applied ack is
+the second path (besides heartbeat) that may move reported state, and
+only when the acked version still equals the device desired version.
+A failed ack never moves reported state; it is kept in the ack log and
+makes the derived status ``failed`` for that desired version. There
+is deliberately no rollout engine in this module: setting a desired
+version only records the intent, and delivery itself lives in the
+sync loop module.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .messages import Heartbeat
+from .messages import Ack, Heartbeat
 
 DEFAULT_HEARTBEAT_TIMEOUT = 30.0
 
@@ -41,6 +45,18 @@ class ConfigVersion:
     body: dict[str, Any]
     created_at: float
     previous_version: int | None
+
+
+@dataclass(frozen=True)
+class AckRecord:
+    """One ack as stored in the append only ack log."""
+
+    device_id: str
+    version: int
+    result: str
+    error: str | None
+    applied_at: float
+    received_at: float
 
 
 @dataclass(frozen=True)
@@ -94,6 +110,19 @@ class Platform:
                     desired_version INTEGER,
                     reported_version INTEGER,
                     last_seen_at REAL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS acks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    result TEXT NOT NULL,
+                    error TEXT,
+                    applied_at REAL NOT NULL,
+                    received_at REAL NOT NULL
                 )
                 """
             )
@@ -199,10 +228,11 @@ class Platform:
     def record_heartbeat(self, heartbeat: Heartbeat) -> DeviceRecord:
         """Apply one heartbeat: refresh reported version and last seen.
 
-        This is the only path in this module that writes
-        ``reported_version``, and it writes exactly what the device
-        said. Desired state is never adopted from a heartbeat, even if
-        the device reports a version the platform did not expect.
+        Alongside ack processing, this is one of the two paths that
+        write ``reported_version``, and it writes exactly what the
+        device said. Desired state is never adopted from a heartbeat,
+        even if the device reports a version the platform did not
+        expect.
         """
         self.get_device(heartbeat.device_id)
         seen_at = self._clock()
@@ -242,14 +272,102 @@ class Platform:
         ).fetchall()
         return [self.get_device(row["device_id"]) for row in rows]
 
+    # Ack processing.
+
+    def record_ack(self, ack: Ack) -> AckRecord | None:
+        """Record one ack and move reported state when it applies.
+
+        Returns the stored record, or None when this exact ack was
+        already recorded (same device, version, result and device
+        side ``applied_at``), so a duplicate delivery changes nothing
+        and is not double counted. An ``applied`` ack moves
+        ``reported_version`` only when the acked version still equals
+        the current ``desired_version``; a stale applied ack is logged
+        but does not move state. A ``failed`` ack never moves reported
+        state. Any non duplicate ack refreshes ``last_seen_at`` with
+        the platform clock.
+        """
+        record = self.get_device(ack.device_id)
+        if ack.result not in ("applied", "failed"):
+            raise ValueError(f"unknown ack result: {ack.result}")
+        existing = self._conn.execute(
+            "SELECT id FROM acks WHERE device_id = ? AND version = ?"
+            " AND result = ? AND applied_at = ?",
+            (ack.device_id, ack.version, ack.result, ack.applied_at),
+        ).fetchone()
+        if existing is not None:
+            return None
+        received_at = self._clock()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO acks"
+                " (device_id, version, result, error, applied_at, received_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    ack.device_id,
+                    ack.version,
+                    ack.result,
+                    ack.error,
+                    ack.applied_at,
+                    received_at,
+                ),
+            )
+            if ack.result == "applied" and ack.version == record.desired_version:
+                self._conn.execute(
+                    "UPDATE devices SET reported_version = ?, last_seen_at = ?"
+                    " WHERE device_id = ?",
+                    (ack.version, received_at, ack.device_id),
+                )
+            else:
+                self._conn.execute(
+                    "UPDATE devices SET last_seen_at = ? WHERE device_id = ?",
+                    (received_at, ack.device_id),
+                )
+        return AckRecord(
+            device_id=ack.device_id,
+            version=ack.version,
+            result=ack.result,
+            error=ack.error,
+            applied_at=ack.applied_at,
+            received_at=received_at,
+        )
+
+    def list_acks(self, device_id: str | None = None) -> list[AckRecord]:
+        if device_id is None:
+            rows = self._conn.execute(
+                "SELECT device_id, version, result, error, applied_at, received_at"
+                " FROM acks ORDER BY id"
+            ).fetchall()
+        else:
+            self.get_device(device_id)
+            rows = self._conn.execute(
+                "SELECT device_id, version, result, error, applied_at, received_at"
+                " FROM acks WHERE device_id = ? ORDER BY id",
+                (device_id,),
+            ).fetchall()
+        return [
+            AckRecord(
+                device_id=row["device_id"],
+                version=int(row["version"]),
+                result=row["result"],
+                error=row["error"],
+                applied_at=float(row["applied_at"]),
+                received_at=float(row["received_at"]),
+            )
+            for row in rows
+        ]
+
+    def last_ack(self, device_id: str) -> AckRecord | None:
+        acks = self.list_acks(device_id)
+        return acks[-1] if acks else None
+
     def device_status(self, device_id: str, *, at: float | None = None) -> str:
         """Derive a device's status from its record, never stored.
 
         ``offline`` when the device has never been seen or its last
         heartbeat is older than the timeout, ``in_sync`` when desired
-        equals reported, and ``pending`` otherwise. The ``failed``
-        status from the design needs ack history and arrives with the
-        sync loop.
+        equals reported, ``failed`` when the last ack for the current
+        desired version failed, and ``pending`` otherwise.
         """
         record = self.get_device(device_id)
         now = self._clock() if at is None else at
@@ -259,6 +377,13 @@ class Platform:
             return "offline"
         if record.desired_version == record.reported_version:
             return "in_sync"
+        last = self.last_ack(device_id)
+        if (
+            last is not None
+            and last.version == record.desired_version
+            and last.result == "failed"
+        ):
+            return "failed"
         return "pending"
 
     def _find_device(self, device_id: str) -> DeviceRecord | None:
