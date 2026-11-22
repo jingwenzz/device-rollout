@@ -52,8 +52,8 @@ def main() -> None:
 
     print(
         "\nNothing has been delivered yet: reported is still v1 for both "
-        "online devices,\nand device-c is offline. The sync loop closes "
-        "this gap in a later step."
+        "online devices,\nand device-c is offline. The sync loop demo "
+        "shows that gap being closed."
     )
     platform.close()
 
